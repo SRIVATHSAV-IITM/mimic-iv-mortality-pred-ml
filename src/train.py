@@ -26,7 +26,6 @@ from sklearn.metrics import (
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
-from xgboost import XGBClassifier
 
 
 TARGET_CANDIDATES = [
@@ -43,6 +42,9 @@ ID_COLUMNS = {
     "icustay_id",
     "admission_id",
     "patient_id",
+    "data_split",
+    "train",
+    "split",
 }
 
 
@@ -115,7 +117,42 @@ def split_by_subject(
     return features[train_mask], features[test_mask], target[train_mask], target[test_mask]
 
 
+def split_features(
+    dataframe: pd.DataFrame,
+    features: pd.DataFrame,
+    target: pd.Series,
+    test_size: float,
+    random_state: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
+    if "data_split" in dataframe.columns:
+        split_values = dataframe["data_split"].astype(str).str.strip().str.lower()
+        train_mask = split_values.eq("train")
+        test_mask = split_values.eq("test")
+        if train_mask.any() and test_mask.any():
+            return features[train_mask], features[test_mask], target[train_mask], target[test_mask]
+
+    if "train" in dataframe.columns:
+        train_values = dataframe["train"]
+        if train_values.dtype == bool:
+            train_mask = train_values
+        else:
+            train_mask = train_values.astype(str).str.strip().str.lower().isin({"true", "1", "yes", "train"})
+        if train_mask.any() and (~train_mask).any():
+            return features[train_mask], features[~train_mask], target[train_mask], target[~train_mask]
+
+    subject_ids = dataframe["subject_id"] if "subject_id" in dataframe.columns else None
+    return split_by_subject(features, target, subject_ids, test_size, random_state)
+
+
 def build_pipeline(features: pd.DataFrame, y_train: pd.Series) -> Pipeline:
+    try:
+        from xgboost import XGBClassifier
+    except ImportError as error:
+        raise ImportError(
+            "xgboost is required for training. Install dependencies with "
+            "`pip install -r requirements.txt`."
+        ) from error
+
     numeric_columns = features.select_dtypes(include=["number"]).columns.tolist()
     categorical_columns = [column for column in features.columns if column not in numeric_columns]
 
@@ -241,22 +278,17 @@ def train(args: argparse.Namespace) -> None:
     target_column = find_target_column(dataframe)
     target = clean_binary_target(dataframe[target_column])
 
+    always_keep = ID_COLUMNS | {target_column}
     missing_fraction = dataframe.isna().mean()
-    retained_columns = missing_fraction[missing_fraction <= args.missingness_threshold].index
+    retained_columns = missing_fraction[
+        (missing_fraction <= args.missingness_threshold) | missing_fraction.index.isin(always_keep)
+    ].index
     dataframe = dataframe[retained_columns]
 
     target = target.loc[dataframe.index]
     drop_columns = [column for column in ID_COLUMNS | {target_column} if column in dataframe.columns]
     features = dataframe.drop(columns=drop_columns)
-    subject_ids = dataframe["subject_id"] if "subject_id" in dataframe.columns else None
-
-    x_train, x_test, y_train, y_test = split_by_subject(
-        features,
-        target,
-        subject_ids,
-        args.test_size,
-        args.random_state,
-    )
+    x_train, x_test, y_train, y_test = split_features(dataframe, features, target, args.test_size, args.random_state)
 
     model = build_pipeline(x_train, y_train)
     model.fit(x_train, y_train)

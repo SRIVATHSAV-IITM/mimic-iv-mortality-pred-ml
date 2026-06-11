@@ -8,6 +8,12 @@ mimic_icu_features.csv
 
 The file should contain one row per ICU stay or prediction unit, structured feature columns, and one binary mortality target column.
 
+To generate it from raw MIMIC-IV tables, run:
+
+```bash
+python src/preprocess.py --mimic-hosp-dir /path/to/mimiciv/hosp --mimic-icu-dir /path/to/mimiciv/icu
+```
+
 Supported target column names:
 
 - `mortality_48h`

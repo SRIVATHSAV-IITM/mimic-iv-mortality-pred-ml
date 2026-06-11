@@ -7,6 +7,7 @@ The project is designed for healthcare analytics and clinical risk prediction wo
 ## Project Highlights
 
 - Predicts short-term ICU mortality from vitals, labs, demographics, and admission-level features.
+- Builds a reusable feature table from raw local MIMIC-IV `hosp` and `icu` tables.
 - Uses subject-level train-test splitting when patient identifiers are available.
 - Handles missing values, categorical variables, and class imbalance.
 - Reports Accuracy, ROC-AUC, PR-AUC, Precision, Recall, F1-score, and confusion matrix.
@@ -16,25 +17,26 @@ The project is designed for healthcare analytics and clinical risk prediction wo
 
 ```text
 mimic-iv-mortality-pred-ml/
-├── data/
-│   └── README.md
-├── models/
-│   └── .gitkeep
-├── notebooks/
-│   └── README.md
-├── outputs/
-│   └── .gitkeep
-├── reports/
-│   └── figures/
-│       └── .gitkeep
-├── src/
-│   ├── __init__.py
-│   ├── feature_importance.py
-│   ├── predict.py
-│   └── train.py
-├── .gitignore
-├── README.md
-└── requirements.txt
+|-- data/
+|   `-- README.md
+|-- models/
+|   `-- .gitkeep
+|-- notebooks/
+|   `-- README.md
+|-- outputs/
+|   `-- .gitkeep
+|-- reports/
+|   `-- figures/
+|       `-- .gitkeep
+|-- src/
+|   |-- __init__.py
+|   |-- feature_importance.py
+|   |-- predict.py
+|   |-- preprocess.py
+|   `-- train.py
+|-- .gitignore
+|-- README.md
+`-- requirements.txt
 ```
 
 ## Data
@@ -45,6 +47,20 @@ MIMIC-IV is a controlled-access clinical dataset. This repository does not inclu
 data/mimic_icu_features.csv
 ```
 
+You can generate this feature table from local MIMIC-IV directories:
+
+```bash
+python src/preprocess.py --mimic-hosp-dir /path/to/mimiciv/hosp --mimic-icu-dir /path/to/mimiciv/icu
+```
+
+The preprocessing script keeps the reusable MIMIC-IV logic from the assignment notebook:
+
+- builds an ICU cohort with stays of at least 24 hours
+- labels mortality between 24 and 48 hours from ICU admission
+- adds age, gender, race, and insurance features
+- extracts first-24-hour routine vital-sign and lab summaries
+- creates a subject-level train/test split in `data_split`
+
 The table should include one binary target column. Supported target names:
 
 - `mortality_48h`
@@ -52,7 +68,7 @@ The table should include one binary target column. Supported target names:
 - `mortality`
 - `hospital_expire_flag`
 
-Optional identifier columns such as `subject_id`, `hadm_id`, and `stay_id` are automatically excluded from model features. If `subject_id` is present, the train-test split is performed at the subject level to reduce patient leakage.
+Optional identifier columns such as `subject_id`, `hadm_id`, and `stay_id` are automatically excluded from model features. If `data_split` or `train` is present, the saved split is reused; otherwise, `subject_id` is used for a subject-level train-test split.
 
 ## Install
 

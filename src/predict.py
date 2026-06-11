@@ -18,13 +18,17 @@ def predict(args: argparse.Namespace) -> None:
     model = bundle["model"]
     target_column = bundle.get("target_column")
     identifier_columns = set(bundle.get("identifier_columns", []))
+    feature_columns = bundle.get("feature_columns")
 
     dataframe = pd.read_csv(input_path)
-    drop_columns = [column for column in identifier_columns if column in dataframe.columns]
-    if target_column in dataframe.columns:
-        drop_columns.append(target_column)
+    if feature_columns:
+        features = dataframe.reindex(columns=feature_columns)
+    else:
+        drop_columns = [column for column in identifier_columns if column in dataframe.columns]
+        if target_column in dataframe.columns:
+            drop_columns.append(target_column)
+        features = dataframe.drop(columns=drop_columns)
 
-    features = dataframe.drop(columns=drop_columns)
     result = dataframe.copy()
     result["mortality_prediction"] = model.predict(features)
 
