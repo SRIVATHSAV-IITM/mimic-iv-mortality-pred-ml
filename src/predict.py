@@ -1,4 +1,4 @@
-"""Run predictions with a trained ICU mortality model."""
+"""Generate predictions with the saved classical mortality model."""
 
 from __future__ import annotations
 
@@ -10,41 +10,36 @@ import pandas as pd
 
 
 def predict(args: argparse.Namespace) -> None:
-    model_path = Path(args.model)
-    input_path = Path(args.input)
-    output_path = Path(args.output)
-
-    bundle = joblib.load(model_path)
+    bundle = joblib.load(args.model)
     model = bundle["model"]
-    target_column = bundle.get("target_column")
-    identifier_columns = set(bundle.get("identifier_columns", []))
-    feature_columns = bundle.get("feature_columns")
+    feature_columns = bundle["feature_columns"]
+    threshold = float(bundle["threshold"])
 
-    dataframe = pd.read_csv(input_path)
-    if feature_columns:
-        features = dataframe.reindex(columns=feature_columns)
-    else:
-        drop_columns = [column for column in identifier_columns if column in dataframe.columns]
-        if target_column in dataframe.columns:
-            drop_columns.append(target_column)
-        features = dataframe.drop(columns=drop_columns)
+    dataframe = pd.read_csv(args.input)
+    missing = sorted(set(feature_columns) - set(dataframe.columns))
+    if missing and not args.allow_missing_columns:
+        raise ValueError(
+            "Input is missing model features. Use --allow-missing-columns only when "
+            f"missing values should be imputed. First missing columns: {missing[:10]}"
+        )
+    features = dataframe.reindex(columns=feature_columns)
+    probabilities = model.predict_proba(features)[:, 1]
 
     result = dataframe.copy()
-    result["mortality_prediction"] = model.predict(features)
-
-    if hasattr(model, "predict_proba"):
-        result["mortality_probability"] = model.predict_proba(features)[:, 1]
-
+    result["mortality_probability"] = probabilities
+    result["mortality_prediction"] = (probabilities >= threshold).astype(int)
+    output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     result.to_csv(output_path, index=False)
-    print(f"Predictions saved to: {output_path}")
+    print(f"Predictions saved to {output_path}; decision threshold={threshold:.4f}")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Predict ICU mortality risk.")
-    parser.add_argument("--model", default="models/xgboost_mortality_model.joblib")
-    parser.add_argument("--input", required=True, help="Input feature CSV.")
-    parser.add_argument("--output", default="outputs/predictions.csv", help="Output CSV path.")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", default="models/best_classical_model.joblib")
+    parser.add_argument("--input", required=True)
+    parser.add_argument("--output", default="outputs/predictions.csv")
+    parser.add_argument("--allow-missing-columns", action="store_true")
     return parser.parse_args()
 
 

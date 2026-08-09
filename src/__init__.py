@@ -1,1 +1,1 @@
-"""MIMIC-IV ICU mortality prediction package."""
+"""Leakage-aware MIMIC-IV ICU mortality prediction project."""
