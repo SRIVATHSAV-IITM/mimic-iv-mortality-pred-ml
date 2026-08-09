@@ -1,4 +1,4 @@
-"""Train an XGBoost model for ICU mortality prediction."""
+"""Train and compare beginner-friendly ICU mortality classifiers."""
 
 from __future__ import annotations
 
@@ -10,157 +10,44 @@ import joblib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from sklearn.calibration import calibration_curve
 from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
-    accuracy_score,
-    average_precision_score,
-    classification_report,
-    confusion_matrix,
     ConfusionMatrixDisplay,
-    f1_score,
-    precision_score,
-    recall_score,
-    roc_auc_score,
+    PrecisionRecallDisplay,
+    RocCurveDisplay,
+    average_precision_score,
 )
-from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+from common import (
+    TARGET_COLUMN,
+    bootstrap_intervals,
+    choose_f1_threshold,
+    classification_metrics,
+    select_training_features,
+    split_modeling_frame,
+)
 
 
-TARGET_CANDIDATES = [
-    "mortality_48h",
-    "48_hour_mortality_flag",
-    "mortality",
-    "hospital_expire_flag",
-]
-
-ID_COLUMNS = {
-    "subject_id",
-    "hadm_id",
-    "stay_id",
-    "icustay_id",
-    "admission_id",
-    "patient_id",
-    "data_split",
-    "train",
-    "split",
-}
-
-
-def find_target_column(dataframe: pd.DataFrame) -> str:
-    for column in TARGET_CANDIDATES:
-        if column in dataframe.columns:
-            return column
-    raise ValueError(
-        "No supported target column found. Expected one of: "
-        + ", ".join(TARGET_CANDIDATES)
-    )
-
-
-def clean_binary_target(series: pd.Series) -> pd.Series:
-    if series.dtype == bool:
-        return series.astype(int)
-
-    normalized = series.astype(str).str.strip().str.lower()
-    mapping = {
-        "true": 1,
-        "t": 1,
-        "yes": 1,
-        "y": 1,
-        "1": 1,
-        "false": 0,
-        "f": 0,
-        "no": 0,
-        "n": 0,
-        "0": 0,
-    }
-    cleaned = normalized.map(mapping)
-    if cleaned.isna().any():
-        cleaned = pd.to_numeric(series, errors="coerce")
-
-    if cleaned.isna().any():
-        raise ValueError("Target column contains values that cannot be parsed as binary.")
-
-    return cleaned.astype(int)
-
-
-def split_by_subject(
-    features: pd.DataFrame,
-    target: pd.Series,
-    subject_ids: pd.Series | None,
-    test_size: float,
-    random_state: int,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
-    if subject_ids is None:
-        stratify = target if target.value_counts().min() >= 2 else None
-        return train_test_split(
-            features,
-            target,
-            test_size=test_size,
-            random_state=random_state,
-            stratify=stratify,
-        )
-
-    subject_frame = pd.DataFrame({"subject_id": subject_ids, "target": target})
-    subject_labels = subject_frame.groupby("subject_id")["target"].max()
-    stratify = subject_labels if subject_labels.value_counts().min() >= 2 else None
-    train_subjects, test_subjects = train_test_split(
-        subject_labels.index,
-        test_size=test_size,
-        random_state=random_state,
-        stratify=stratify,
-    )
-
-    train_mask = subject_ids.isin(train_subjects)
-    test_mask = subject_ids.isin(test_subjects)
-    return features[train_mask], features[test_mask], target[train_mask], target[test_mask]
-
-
-def split_features(
-    dataframe: pd.DataFrame,
-    features: pd.DataFrame,
-    target: pd.Series,
-    test_size: float,
-    random_state: int,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
-    if "data_split" in dataframe.columns:
-        split_values = dataframe["data_split"].astype(str).str.strip().str.lower()
-        train_mask = split_values.eq("train")
-        test_mask = split_values.eq("test")
-        if train_mask.any() and test_mask.any():
-            return features[train_mask], features[test_mask], target[train_mask], target[test_mask]
-
-    if "train" in dataframe.columns:
-        train_values = dataframe["train"]
-        if train_values.dtype == bool:
-            train_mask = train_values
-        else:
-            train_mask = train_values.astype(str).str.strip().str.lower().isin({"true", "1", "yes", "train"})
-        if train_mask.any() and (~train_mask).any():
-            return features[train_mask], features[~train_mask], target[train_mask], target[~train_mask]
-
-    subject_ids = dataframe["subject_id"] if "subject_id" in dataframe.columns else None
-    return split_by_subject(features, target, subject_ids, test_size, random_state)
-
-
-def build_pipeline(features: pd.DataFrame, y_train: pd.Series) -> Pipeline:
-    try:
-        from xgboost import XGBClassifier
-    except ImportError as error:
-        raise ImportError(
-            "xgboost is required for training. Install dependencies with "
-            "`pip install -r requirements.txt`."
-        ) from error
-
+def build_preprocessor(features: pd.DataFrame) -> ColumnTransformer:
+    """Create train-fitted numeric and categorical preprocessing."""
     numeric_columns = features.select_dtypes(include=["number"]).columns.tolist()
     categorical_columns = [column for column in features.columns if column not in numeric_columns]
-
-    preprocessor = ColumnTransformer(
+    return ColumnTransformer(
         transformers=[
             (
                 "numeric",
-                SimpleImputer(strategy="median"),
+                Pipeline(
+                    steps=[
+                        ("imputer", SimpleImputer(strategy="median")),
+                        ("scaler", StandardScaler()),
+                    ]
+                ),
                 numeric_columns,
             ),
             (
@@ -173,165 +60,230 @@ def build_pipeline(features: pd.DataFrame, y_train: pd.Series) -> Pipeline:
                 ),
                 categorical_columns,
             ),
-        ]
+        ],
+        remainder="drop",
     )
 
+
+def build_models(
+    features: pd.DataFrame,
+    y_train: pd.Series,
+    random_state: int,
+) -> dict[str, Pipeline]:
+    """Return interpretable baselines and one boosted-tree model."""
     negative_count = int((y_train == 0).sum())
     positive_count = int((y_train == 1).sum())
-    scale_pos_weight = negative_count / positive_count if positive_count else 1.0
+    scale_pos_weight = negative_count / max(positive_count, 1)
 
-    model = XGBClassifier(
-        objective="binary:logistic",
-        eval_metric="logloss",
-        n_estimators=500,
-        max_depth=5,
-        learning_rate=0.03,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        scale_pos_weight=scale_pos_weight,
-        random_state=42,
-        n_jobs=4,
-    )
-
-    return Pipeline(
-        steps=[
-            ("preprocessor", preprocessor),
-            ("classifier", model),
-        ]
-    )
-
-
-def evaluate_model(model: Pipeline, x_test: pd.DataFrame, y_test: pd.Series) -> dict:
-    predictions = model.predict(x_test)
-    probabilities = model.predict_proba(x_test)[:, 1]
-
-    metrics = {
-        "accuracy": accuracy_score(y_test, predictions),
-        "precision": precision_score(y_test, predictions, zero_division=0),
-        "recall": recall_score(y_test, predictions, zero_division=0),
-        "f1": f1_score(y_test, predictions, zero_division=0),
-        "average_precision_pr_auc": average_precision_score(y_test, probabilities),
-        "confusion_matrix": confusion_matrix(y_test, predictions).tolist(),
-        "classification_report": classification_report(
-            y_test,
-            predictions,
-            zero_division=0,
-            output_dict=True,
+    estimators: dict[str, object] = {
+        "logistic_regression": LogisticRegression(
+            class_weight="balanced",
+            max_iter=1_000,
+            random_state=random_state,
+        ),
+        "random_forest": RandomForestClassifier(
+            n_estimators=300,
+            max_depth=8,
+            min_samples_leaf=5,
+            class_weight="balanced",
+            random_state=random_state,
+            n_jobs=-1,
         ),
     }
 
-    if y_test.nunique() == 2:
-        metrics["roc_auc"] = roc_auc_score(y_test, probabilities)
+    try:
+        from xgboost import XGBClassifier
 
-    return metrics
+        estimators["xgboost"] = XGBClassifier(
+            objective="binary:logistic",
+            eval_metric="logloss",
+            n_estimators=400,
+            max_depth=4,
+            learning_rate=0.04,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            scale_pos_weight=scale_pos_weight,
+            random_state=random_state,
+            n_jobs=4,
+        )
+    except ImportError:
+        print("xgboost is not installed; training the two scikit-learn baselines only.")
+
+    return {
+        name: Pipeline(
+            steps=[
+                ("preprocessor", build_preprocessor(features)),
+                ("classifier", estimator),
+            ]
+        )
+        for name, estimator in estimators.items()
+    }
 
 
-def get_feature_importance(model: Pipeline) -> pd.DataFrame:
-    preprocessor = model.named_steps["preprocessor"]
-    classifier = model.named_steps["classifier"]
-    feature_names = preprocessor.get_feature_names_out()
-    importances = classifier.feature_importances_
-
-    return (
-        pd.DataFrame({"feature": feature_names, "importance": importances})
-        .sort_values("importance", ascending=False)
-        .reset_index(drop=True)
-    )
-
-
-def save_figures(
-    model: Pipeline,
-    x_test: pd.DataFrame,
+def save_evaluation_figures(
     y_test: pd.Series,
-    importance: pd.DataFrame,
-    figures_dir: Path,
+    probabilities: np.ndarray,
+    threshold: float,
+    output_dir: Path,
 ) -> None:
-    figures_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    predictions = (probabilities >= threshold).astype(int)
 
-    predictions = model.predict(x_test)
-    ConfusionMatrixDisplay.from_predictions(y_test, predictions)
-    plt.title("ICU Mortality Confusion Matrix")
+    ConfusionMatrixDisplay.from_predictions(y_test, predictions, labels=[0, 1])
+    plt.title("Test-set confusion matrix")
     plt.tight_layout()
-    plt.savefig(figures_dir / "confusion_matrix.png", dpi=160)
+    plt.savefig(output_dir / "confusion_matrix.png", dpi=160)
     plt.close()
 
-    top_features = importance.head(20).iloc[::-1]
-    plt.figure(figsize=(10, 8))
-    plt.barh(top_features["feature"], top_features["importance"])
-    plt.title("Top XGBoost Feature Importances")
-    plt.xlabel("Importance")
+    RocCurveDisplay.from_predictions(y_test, probabilities)
+    plt.title("Test-set ROC curve")
     plt.tight_layout()
-    plt.savefig(figures_dir / "top_features.png", dpi=160)
+    plt.savefig(output_dir / "roc_curve.png", dpi=160)
+    plt.close()
+
+    PrecisionRecallDisplay.from_predictions(y_test, probabilities)
+    plt.title("Test-set precision-recall curve")
+    plt.tight_layout()
+    plt.savefig(output_dir / "precision_recall_curve.png", dpi=160)
+    plt.close()
+
+    observed, predicted = calibration_curve(y_test, probabilities, n_bins=8, strategy="quantile")
+    plt.figure(figsize=(6, 5))
+    plt.plot(predicted, observed, marker="o", label="Model")
+    plt.plot([0, 1], [0, 1], linestyle="--", color="black", label="Ideal")
+    plt.xlabel("Mean predicted risk")
+    plt.ylabel("Observed mortality fraction")
+    plt.title("Test-set calibration")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_dir / "calibration_curve.png", dpi=160)
     plt.close()
 
 
 def train(args: argparse.Namespace) -> None:
-    data_path = Path(args.data)
+    dataframe = pd.read_csv(args.data)
+    if TARGET_COLUMN not in dataframe.columns:
+        raise ValueError(
+            f"Expected target column {TARGET_COLUMN!r}. Run src/preprocess.py first."
+        )
+
+    split = split_modeling_frame(dataframe, TARGET_COLUMN)
+    selected_features = select_training_features(
+        split.x_train,
+        maximum_missing_fraction=args.maximum_missing_fraction,
+    )
+    x_train = split.x_train[selected_features]
+    x_validation = split.x_validation.reindex(columns=selected_features)
+    x_test = split.x_test.reindex(columns=selected_features)
+
+    comparison_rows: list[dict[str, float | str]] = []
+    fitted_models: dict[str, Pipeline] = {}
+    thresholds: dict[str, float] = {}
+
+    for name, model in build_models(x_train, split.y_train, args.random_state).items():
+        print(f"Training {name}...")
+        model.fit(x_train, split.y_train)
+        validation_probabilities = model.predict_proba(x_validation)[:, 1]
+        threshold = choose_f1_threshold(split.y_validation, validation_probabilities)
+        validation_metrics = classification_metrics(
+            split.y_validation,
+            validation_probabilities,
+            threshold,
+        )
+        comparison_rows.append(
+            {
+                "model": name,
+                "validation_pr_auc": float(
+                    average_precision_score(split.y_validation, validation_probabilities)
+                ),
+                "validation_roc_auc": float(validation_metrics.get("roc_auc", np.nan)),
+                "validation_f1": float(validation_metrics["f1"]),
+                "selected_threshold": threshold,
+            }
+        )
+        fitted_models[name] = model
+        thresholds[name] = threshold
+
+    comparison = pd.DataFrame(comparison_rows).sort_values(
+        "validation_pr_auc", ascending=False
+    )
+    best_name = str(comparison.iloc[0]["model"])
+    best_model = fitted_models[best_name]
+    best_threshold = thresholds[best_name]
+    test_probabilities = best_model.predict_proba(x_test)[:, 1]
+    test_metrics = classification_metrics(split.y_test, test_probabilities, best_threshold)
+    confidence_intervals = bootstrap_intervals(
+        split.y_test,
+        test_probabilities,
+        best_threshold,
+        repetitions=args.bootstrap_repetitions,
+        random_state=args.random_state,
+    )
+
     models_dir = Path(args.models_dir)
     outputs_dir = Path(args.outputs_dir)
     figures_dir = Path(args.figures_dir)
-
     models_dir.mkdir(parents=True, exist_ok=True)
     outputs_dir.mkdir(parents=True, exist_ok=True)
 
-    dataframe = pd.read_csv(data_path)
-    target_column = find_target_column(dataframe)
-    target = clean_binary_target(dataframe[target_column])
-
-    always_keep = ID_COLUMNS | {target_column}
-    missing_fraction = dataframe.isna().mean()
-    retained_columns = missing_fraction[
-        (missing_fraction <= args.missingness_threshold) | missing_fraction.index.isin(always_keep)
-    ].index
-    dataframe = dataframe[retained_columns]
-
-    target = target.loc[dataframe.index]
-    drop_columns = [column for column in ID_COLUMNS | {target_column} if column in dataframe.columns]
-    features = dataframe.drop(columns=drop_columns)
-    x_train, x_test, y_train, y_test = split_features(dataframe, features, target, args.test_size, args.random_state)
-
-    model = build_pipeline(x_train, y_train)
-    model.fit(x_train, y_train)
-
-    metrics = evaluate_model(model, x_test, y_test)
-    importance = get_feature_importance(model)
-    save_figures(model, x_test, y_test, importance, figures_dir)
-
     bundle = {
-        "model": model,
-        "target_column": target_column,
-        "feature_columns": list(features.columns),
-        "identifier_columns": sorted(ID_COLUMNS),
-        "metrics": metrics,
+        "model": best_model,
+        "model_name": best_name,
+        "target_column": TARGET_COLUMN,
+        "feature_columns": selected_features,
+        "threshold": best_threshold,
+        "outcome_definition": (
+            "In-hospital death after the 24-hour ICU landmark and no later than "
+            "48 hours after ICU admission."
+        ),
     }
-    joblib.dump(bundle, models_dir / "xgboost_mortality_model.joblib")
+    joblib.dump(bundle, models_dir / "best_classical_model.joblib")
 
+    report = {
+        "best_model": best_name,
+        "selection_metric": "validation_pr_auc",
+        "selected_threshold": best_threshold,
+        "selected_feature_count": len(selected_features),
+        "split_sizes": {
+            "train": len(x_train),
+            "validation": len(x_validation),
+            "test": len(x_test),
+        },
+        "test_metrics": test_metrics,
+        "test_95_percent_bootstrap_intervals": confidence_intervals,
+    }
     with (outputs_dir / "metrics.json").open("w", encoding="utf-8") as file:
-        json.dump(metrics, file, indent=2)
+        json.dump(report, file, indent=2)
+    comparison.to_csv(outputs_dir / "model_comparison.csv", index=False)
+    pd.DataFrame(
+        {
+            "probability": test_probabilities,
+            "prediction": (test_probabilities >= best_threshold).astype(int),
+            "observed": split.y_test.to_numpy(),
+        }
+    ).to_csv(outputs_dir / "test_predictions.csv", index=False)
+    save_evaluation_figures(
+        split.y_test,
+        test_probabilities,
+        best_threshold,
+        figures_dir,
+    )
 
-    importance.to_csv(outputs_dir / "feature_importance.csv", index=False)
-
-    print(f"Accuracy: {metrics['accuracy']:.4f}")
-    if "roc_auc" in metrics:
-        print(f"ROC-AUC: {metrics['roc_auc']:.4f}")
-    print(f"PR-AUC: {metrics['average_precision_pr_auc']:.4f}")
-    print(f"Model saved to: {models_dir / 'xgboost_mortality_model.joblib'}")
+    print(comparison.to_string(index=False))
+    print(f"Best model: {best_name}")
+    print(f"Test PR-AUC: {test_metrics['pr_auc_average_precision']:.4f}")
+    print(f"Test ROC-AUC: {test_metrics.get('roc_auc', float('nan')):.4f}")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train ICU mortality prediction model.")
-    parser.add_argument("--data", default="data/mimic_icu_features.csv", help="Input feature CSV.")
-    parser.add_argument("--models-dir", default="models", help="Directory for model artifacts.")
-    parser.add_argument("--outputs-dir", default="outputs", help="Directory for metrics outputs.")
-    parser.add_argument("--figures-dir", default="reports/figures", help="Directory for figures.")
-    parser.add_argument("--test-size", type=float, default=0.2, help="Test split fraction.")
-    parser.add_argument("--random-state", type=int, default=42, help="Random seed.")
-    parser.add_argument(
-        "--missingness-threshold",
-        type=float,
-        default=0.2,
-        help="Drop columns with missing fraction above this threshold.",
-    )
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data", default="data/mimic_icu_features.csv")
+    parser.add_argument("--models-dir", default="models")
+    parser.add_argument("--outputs-dir", default="outputs")
+    parser.add_argument("--figures-dir", default="reports/figures")
+    parser.add_argument("--maximum-missing-fraction", type=float, default=0.80)
+    parser.add_argument("--bootstrap-repetitions", type=int, default=200)
+    parser.add_argument("--random-state", type=int, default=42)
     return parser.parse_args()
 
 

@@ -1,14 +1,25 @@
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.ruff_cache/
 .venv/
 venv/
-env/
 
+# Controlled MIMIC-IV data and all derived patient-level artifacts
 data/*.csv
+data/*.csv.gz
 data/*.parquet
 data/*.npy
 models/*.joblib
+models/*.pt
 outputs/*.csv
 outputs/*.json
 reports/figures/*.png
-reports/figures/*.jpg
+reports/figures/**/*.png
+reports/figures/*.csv
+
+# Keep folder placeholders and documentation
+!data/README.md
+!models/.gitkeep
+!outputs/.gitkeep
+!reports/figures/.gitkeep

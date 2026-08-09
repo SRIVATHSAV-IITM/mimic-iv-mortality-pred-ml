@@ -1,26 +1,21 @@
-# Data Folder
+# Local data directory
 
-Place your prepared MIMIC-IV ICU feature table here as:
+MIMIC-IV is controlled-access. Do not commit raw or derived patient data.
 
-```text
-mimic_icu_features.csv
-```
-
-The file should contain one row per ICU stay or prediction unit, structured feature columns, and one binary mortality target column.
-
-To generate it from raw MIMIC-IV tables, run:
+After receiving authorized access, build the local feature table with:
 
 ```bash
-python src/preprocess.py --mimic-hosp-dir /path/to/mimiciv/hosp --mimic-icu-dir /path/to/mimiciv/icu
+python src/preprocess.py \
+  --mimic-hosp-dir /path/to/mimiciv/hosp \
+  --mimic-icu-dir /path/to/mimiciv/icu
 ```
 
-Supported target column names:
+This creates `data/mimic_icu_features.csv`, which remains ignored by Git.
 
-- `mortality_48h`
-- `48_hour_mortality_flag`
-- `mortality`
-- `hospital_expire_flag`
+For a software-only smoke test:
 
-Common identifier columns such as `subject_id`, `hadm_id`, and `stay_id` can be included. They are used for splitting or excluded from model training.
+```bash
+python scripts/generate_synthetic_data.py
+```
 
-Do not commit real MIMIC-IV data to this repository.
+`synthetic_features.csv` is fake and cannot support clinical claims.
